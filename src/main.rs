@@ -1,3 +1,9 @@
+extern crate xi_rpc;
+#[macro_use]
+extern crate serde_json;
+extern crate chrono;
+extern crate sys_info;
+
 use std::process;
 use std::thread;
 use std::time::{Instant, Duration};
@@ -6,15 +12,29 @@ use std::sync::{Mutex, Arc, Barrier};
 use std::borrow::Cow;
 use std::fmt;
 
+use chrono::prelude::*;
+use serde_json::Value;
+
 fn main() {
-    eprintln!("\n###time_init###\n");
+    let utc: DateTime<Utc> = Utc::now();
+    let hostname = sys_info::hostname().unwrap_or("".into());
+    let cpu_num = sys_info::cpu_num().unwrap_or_default();
+    let cpu_speed = sys_info::cpu_speed().unwrap_or_default();
+    let os_type = sys_info::os_type().unwrap_or("".into());
+    let os_release = sys_info::os_release().unwrap_or("".into());
+
+    println!("{}", utc.to_string());
+    println!("{} {} v{} {}x{}Mhz", hostname, os_type, os_release, cpu_num, cpu_speed);
+    println!("\n###timestamped init###\n");
     time_init();
+    println!("\n###sync roundtrip###\n");
+    peer_profile();
 }
 
 
 fn time_init() {
 
-    let (mut stdin, stdout) = setup_core();
+    let (mut stdin, stdout, _) = setup_core();
     let all_results = Arc::new(Mutex::new(Vec::new()));
     let all_results2 = all_results.clone();
 
@@ -61,7 +81,6 @@ fn time_init() {
         all_results.append(&mut local_results);
     }
 
-    eprintln!("joining read thread");
     read_handle.join().unwrap();
 
     let all_results = Arc::try_unwrap(all_results).unwrap();
@@ -70,17 +89,74 @@ fn time_init() {
     format_results(start, all_results);
 }
 
-fn setup_core() -> (process::ChildStdin, process::ChildStdout) {
+#[derive(Debug, Clone, Default)]
+struct ProfileHandler {
+    events: Vec<(Instant, String)>,
+}
+
+impl xi_rpc::Handler for ProfileHandler {
+    type Notification = xi_rpc::RpcCall;
+    type Request = xi_rpc::RpcCall;
+
+    fn handle_notification(&mut self, _ctx: &xi_rpc::RpcCtx, rpc: Self::Notification) {
+        self.events.push((Instant::now(), rpc.method));
+    }
+
+    fn handle_request(&mut self, _ctx: &xi_rpc::RpcCtx, rpc: Self::Request)
+                      -> Result<Value, xi_rpc::RemoteError> {
+        self.events.push((Instant::now(), rpc.method));
+        Ok(json!(1))
+    }
+}
+
+fn peer_profile() {
+    let num_runs: u32 = 100;
+
+    let (stdin, stdout, mut core) = setup_core();
+    let mut looper = xi_rpc::RpcLoop::new(stdin);
+    let peer: xi_rpc::RpcPeer = Box::new(looper.get_raw_peer());
+    let b1_1 = Arc::new(Barrier::new(2));
+    let b1_2 = b1_1.clone();
+    thread::spawn(move || {
+        b1_1.wait();
+        peer.send_rpc_notification("client_started", &json!({}));
+        let mut results = Vec::new();
+
+        for _ in 0..num_runs {
+            thread::sleep(Duration::from_millis(10));
+            let send = Instant::now();
+            let _ = peer.send_rpc_request("new_view", &json!({}));
+            let duration = send.elapsed();
+            results.push(duration);
+        }
+        let mean: Duration = results.iter().sum();
+        let mean = mean / num_runs;
+        let min = results.iter().min().unwrap().to_owned();
+        let max = results.iter().max().unwrap().to_owned();
+        println!("ran {} sync RPC requests:", num_runs);
+        println!("mean: {}", FormattedTime::new(mean));
+        println!("min: {}", FormattedTime::new(min));
+        println!("max: {}", FormattedTime::new(max));
+        core.kill().unwrap();
+    });
+
+    let mut handler = ProfileHandler::default();
+    b1_2.wait();
+    let _ = looper.mainloop(|| BufReader::new(stdout), &mut handler);
+}
+
+fn setup_core() -> (process::ChildStdin, process::ChildStdout, process::Child) {
     let core_path = "./xi-editor/rust/target/release/xi-core";
     let mut core = process::Command::new(&core_path)
         .stdin(process::Stdio::piped())
         .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::null())
         .spawn()
         .expect("xi-core must start");
 
     let stdin = core.stdin.take().unwrap();
     let stdout = core.stdout.take().unwrap();
-    (stdin, stdout)
+    (stdin, stdout, core)
 }
 
 fn format_results(start: Instant, results: Vec<(Instant, &'static str, Cow<str>)>) {
@@ -96,7 +172,7 @@ fn format_results(start: Instant, results: Vec<(Instant, &'static str, Cow<str>)
             r.push_str("...");
         }
         let t = format!("{}", FormattedTime::new(d));
-        eprintln!("{:10} {}  {}", t, s, r);
+        println!("{:10} {}  {}", t, s, r);
     }
 }
 
@@ -115,11 +191,11 @@ impl FormattedTime {
     pub fn new(d: Duration) -> Self {
         let d = nanos_from_duration(d);
         let secs = d / 1_000_000_000;
-        let d = d - secs;
+        let d = d - secs * 1_000_000_000;
         let millis = d / 1_000_000;
-        let d = d - millis;
+        let d = d - millis * 1_000_000;
         let micros = d / 1_000;
-        let nanos = d - micros;
+        let nanos = d - micros * 1_000;
         FormattedTime { secs, millis, micros, nanos }
     }
 }
@@ -137,47 +213,3 @@ impl fmt::Display for FormattedTime {
         }
     }
 }
-
-//pub fn start_plugin_process<C>(manager_ref: &PluginManagerRef,
-                          //plugin_desc: &PluginDescription,
-                          //identifier: PluginPid,
-                          //completion: C)
-    //where C: FnOnce(Result<PluginRef, io::Error>) + Send + 'static
-//{
-
-    //let manager_ref = manager_ref.to_weak();
-    //let plugin_desc = plugin_desc.to_owned();
-
-    //thread::spawn(move || {
-        //eprintln!("starting plugin at path {:?}", &plugin_desc.exec_path);
-        //let child = ProcCommand::new(&plugin_desc.exec_path)
-            //.stdin(Stdio::piped())
-            //.stdout(Stdio::piped())
-            //.spawn();
-
-        //match child {
-            //Ok(mut child) => {
-                //let child_stdin = child.stdin.take().unwrap();
-                //let child_stdout = child.stdout.take().unwrap();
-                //let mut looper = RpcLoop::new(child_stdin);
-                //let peer: RpcPeer = Box::new(looper.get_raw_peer());
-                //peer.send_rpc_notification("ping", &Value::Array(Vec::new()));
-                //let plugin = Plugin {
-                    //peer: peer,
-                    //process: child,
-                    //manager: manager_ref,
-                    //description: plugin_desc,
-                    //identifier: identifier,
-                //};
-                //let mut plugin_ref = PluginRef(
-                    //Arc::new(Mutex::new(plugin)),
-                    //Arc::new(AtomicBool::new(false)));
-                //completion(Ok(plugin_ref.clone()));
-                ////TODO: we could be logging plugin exit results
-                //let _ = looper.mainloop(|| BufReader::new(child_stdout),
-                                        //&mut plugin_ref);
-            //}
-            //Err(err) => completion(Err(err)),
-        //}
-    //});
-
