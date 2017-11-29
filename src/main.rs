@@ -115,9 +115,10 @@ fn peer_profile() {
     let b1_1 = Arc::new(Barrier::new(2));
     let b1_2 = b1_1.clone();
     thread::spawn(move || {
-        b1_1.wait();
         peer.send_rpc_notification("client_started", &json!({}));
+        thread::sleep(Duration::new(1, 0));
         let mut results = Vec::new();
+        b1_1.wait();
 
         for _ in 0..num_runs {
             thread::sleep(Duration::from_millis(10));
@@ -126,6 +127,7 @@ fn peer_profile() {
             let duration = send.elapsed();
             results.push(duration);
         }
+
         let mean: Duration = results.iter().sum();
         let mean = mean / num_runs;
         let min = results.iter().min().unwrap().to_owned();
