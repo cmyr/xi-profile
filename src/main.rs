@@ -17,14 +17,24 @@ use serde_json::Value;
 
 fn main() {
     let utc: DateTime<Utc> = Utc::now();
-    let hostname = sys_info::hostname().unwrap_or("".into());
     let cpu_num = sys_info::cpu_num().unwrap_or_default();
     let cpu_speed = sys_info::cpu_speed().unwrap_or_default();
     let os_type = sys_info::os_type().unwrap_or("".into());
     let os_release = sys_info::os_release().unwrap_or("".into());
+    let load_avg = match sys_info::loadavg() {
+        Ok(load) => format!("{:.2}/{:.2}/{:.2}", load.one, load.five, load.fifteen),
+        Err(_) => "unavailable".to_owned(),
+    };
+
+    let mem_info = match sys_info::mem_info() {
+        Ok(mem) => format!("{:?}", mem),
+        Err(_) => "mem_info unavailable".to_owned(),
+    };
 
     println!("{}", utc.to_string());
-    println!("{} {} v{} {}x{}Mhz", hostname, os_type, os_release, cpu_num, cpu_speed);
+    println!("{} v{}", os_type, os_release);
+    println!("cpu: {} @ {}MHz, load: {}", cpu_num, cpu_speed, load_avg);
+    println!("{}", mem_info);
     println!("\n###timestamped init###\n");
     time_init();
     println!("\n###sync roundtrip###\n");
@@ -32,6 +42,10 @@ fn main() {
 }
 
 
+/// Runs a typical startup sequence, logging the time (relative to
+/// the first message send) of each RPC sent and received.
+///
+/// This also runs the syntect plugin.
 fn time_init() {
 
     let (mut stdin, stdout, _) = setup_core();
@@ -64,7 +78,7 @@ fn time_init() {
     let mut local_results = Vec::new();
 
     // let core setup
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(1000));
     barrier.wait();
     let start = Instant::now();
 
@@ -73,7 +87,8 @@ fn time_init() {
         local_results.push((Instant::now(), "->", Cow::from(line)));
     }
 
-    thread::sleep(Duration::from_millis(2000));
+    // give core time to quiet down before killing
+    thread::sleep(Duration::from_millis(1000));
     stdin.write_all("null\n".as_bytes()).unwrap();
 
     {
@@ -89,26 +104,8 @@ fn time_init() {
     format_results(start, all_results);
 }
 
-#[derive(Debug, Clone, Default)]
-struct ProfileHandler {
-    events: Vec<(Instant, String)>,
-}
-
-impl xi_rpc::Handler for ProfileHandler {
-    type Notification = xi_rpc::RpcCall;
-    type Request = xi_rpc::RpcCall;
-
-    fn handle_notification(&mut self, _ctx: &xi_rpc::RpcCtx, rpc: Self::Notification) {
-        self.events.push((Instant::now(), rpc.method));
-    }
-
-    fn handle_request(&mut self, _ctx: &xi_rpc::RpcCtx, rpc: Self::Request)
-                      -> Result<Value, xi_rpc::RemoteError> {
-        self.events.push((Instant::now(), rpc.method));
-        Ok(json!(1))
-    }
-}
-
+/// Spawns a local rpc runloop, and from another thread sends a bunch
+/// of 'new_view' requests to xi-core.
 fn peer_profile() {
     let num_runs: u32 = 100;
 
@@ -134,9 +131,9 @@ fn peer_profile() {
         let min = results.iter().min().unwrap().to_owned();
         let max = results.iter().max().unwrap().to_owned();
         println!("ran {} sync RPC requests:", num_runs);
-        println!("mean: {}", FormattedTime::new(mean));
-        println!("min: {}", FormattedTime::new(min));
-        println!("max: {}", FormattedTime::new(max));
+        println!("mean: {}", PrettyDuration::new(mean));
+        println!("min: {}", PrettyDuration::new(min));
+        println!("max: {}", PrettyDuration::new(max));
         core.kill().unwrap();
     });
 
@@ -171,7 +168,7 @@ fn format_results(start: Instant, results: Vec<(Instant, &'static str, Cow<str>)
             r.truncate(max_width);
             r.push_str("...");
         }
-        let t = format!("{}", FormattedTime::new(d));
+        let t = format!("{}", PrettyDuration::new(d));
         println!("{:10} {}  {}", t, s, r);
     }
 }
@@ -180,14 +177,14 @@ fn nanos_from_duration(d: Duration) -> u64 {
     d.as_secs() * 1_000_000_000 + d.subsec_nanos() as u64
 }
 
-struct FormattedTime {
+struct PrettyDuration {
     secs: u64,
     millis: u64,
     micros: u64,
     nanos: u64,
 }
 
-impl FormattedTime {
+impl PrettyDuration {
     pub fn new(d: Duration) -> Self {
         let d = nanos_from_duration(d);
         let secs = d / 1_000_000_000;
@@ -196,11 +193,11 @@ impl FormattedTime {
         let d = d - millis * 1_000_000;
         let micros = d / 1_000;
         let nanos = d - micros * 1_000;
-        FormattedTime { secs, millis, micros, nanos }
+        PrettyDuration { secs, millis, micros, nanos }
     }
 }
 
-impl fmt::Display for FormattedTime {
+impl fmt::Display for PrettyDuration {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.secs > 0 {
             write!(f, "{}.{}s", self.secs, self.millis / 100)
@@ -213,3 +210,25 @@ impl fmt::Display for FormattedTime {
         }
     }
 }
+
+//NOTE: this isn't really used right now
+#[derive(Debug, Clone, Default)]
+struct ProfileHandler {
+    events: Vec<(Instant, String)>,
+}
+
+impl xi_rpc::Handler for ProfileHandler {
+    type Notification = xi_rpc::RpcCall;
+    type Request = xi_rpc::RpcCall;
+
+    fn handle_notification(&mut self, _ctx: &xi_rpc::RpcCtx, rpc: Self::Notification) {
+        self.events.push((Instant::now(), rpc.method));
+    }
+
+    fn handle_request(&mut self, _ctx: &xi_rpc::RpcCtx, rpc: Self::Request)
+                      -> Result<Value, xi_rpc::RemoteError> {
+        self.events.push((Instant::now(), rpc.method));
+        Ok(json!(1))
+    }
+}
+
